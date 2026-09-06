@@ -4,12 +4,20 @@
 #
 # WHAT CHANGED FROM THE ORIGINAL v21 SCRIPT:
 #   - No Excel workbook, no local trade journal / outcome tracking
-#   - No CoinGecko dependency — universe is built from Binance's
-#     own 24h volume ranking + a static watchlist
+#   - No CoinGecko dependency — universe is built from the
+#     exchange's own 24h volume ranking + a static watchlist
 #   - Sends a Telegram message for new A+/A tier signals
 #   - Keeps a small JSON "state" file to avoid re-alerting the
 #     same setup every run (designed to be committed back to the
 #     repo by the GitHub Actions workflow)
+#
+# DATA SOURCE: Bybit's public v5 market API (category=linear, i.e.
+# USDT-margined perpetuals), not Binance. Binance's futures API
+# returns HTTP 451 to requests coming from major cloud-provider IP
+# ranges (AWS/GCP/Azure) — which is exactly what GitHub Actions
+# runners use — so it cannot be called reliably from a scheduled
+# GitHub workflow. Bybit's public market-data endpoints do not
+# require an API key and are not on that same blocklist.
 #
 # IMPORTANT: This is a research/scanner script. It does not place
 # orders and does not output position sizing. Treat every alert as
@@ -35,7 +43,16 @@ from scipy.signal import find_peaks
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ========================= CONFIG =========================
-BINANCE_FUTURES_API_URL = "https://fapi.binance.com/fapi/v1"
+BYBIT_API_URL = "https://api.bybit.com"
+
+# Bybit's kline endpoint takes interval codes rather than "4h"/"15m" style strings.
+BYBIT_INTERVAL_MAP = {
+    "4h": "240",
+    "15m": "15",
+    "5m": "5",
+    "1d": "D",
+    "1w": "W",
+}
 
 DATA_LOOKBACK_4H = 300
 DATA_LOOKBACK_15M = 300
@@ -169,28 +186,31 @@ def make_api_request(url: str, retries: int = 3, use_cache: bool = True, ttl: in
 
 
 def get_valid_futures_symbols() -> set[str]:
-    data = make_api_request(f"{BINANCE_FUTURES_API_URL}/exchangeInfo", ttl=3600)
-    if not data or "symbols" not in data:
-        logging.warning("Could not fetch exchangeInfo — falling back to empty valid set")
+    """Bybit equivalent of Binance's exchangeInfo: list all tradeable
+    USDT-margined linear perpetuals."""
+    data = make_api_request(f"{BYBIT_API_URL}/v5/market/instruments-info?category=linear", ttl=3600)
+    if not data or data.get("retCode") != 0:
+        logging.warning("Could not fetch Bybit instruments-info — falling back to empty valid set")
         return set()
     valid = set()
-    for s in data["symbols"]:
-        if (s.get("status") == "TRADING"
-                and s.get("contractType") == "PERPETUAL"
-                and s.get("quoteAsset") == "USDT"
+    for s in data.get("result", {}).get("list", []):
+        if (s.get("status") == "Trading"
+                and s.get("contractType") == "LinearPerpetual"
+                and s.get("quoteCoin") == "USDT"
                 and str(s.get("symbol", "")).endswith("USDT")):
             valid.add(s["symbol"])
     return valid
 
 
 def get_top_symbols_by_volume(valid_futures: set[str], top_n: int = TOP_N_BY_VOLUME) -> list[str]:
-    """Replaces the old CoinGecko market-cap ranking: rank Binance USDT-M
-    perpetuals by 24h quote volume, using data we already have access to."""
-    data = make_api_request(f"{BINANCE_FUTURES_API_URL}/ticker/24hr", ttl=300, use_cache=True)
-    if not data:
+    """Replaces the old CoinGecko market-cap ranking: rank Bybit USDT-M
+    perpetuals by 24h turnover (quote volume), using data we already
+    have access to."""
+    data = make_api_request(f"{BYBIT_API_URL}/v5/market/tickers?category=linear", ttl=300, use_cache=True)
+    if not data or data.get("retCode") != 0:
         return []
     rows = []
-    for t in data:
+    for t in data.get("result", {}).get("list", []):
         sym = t.get("symbol", "")
         if sym not in valid_futures:
             continue
@@ -198,7 +218,7 @@ def get_top_symbols_by_volume(valid_futures: set[str], top_n: int = TOP_N_BY_VOL
         if base in STABLE_BLACKLIST:
             continue
         try:
-            qv = float(t.get("quoteVolume", 0))
+            qv = float(t.get("turnover24h", 0))
         except (TypeError, ValueError):
             qv = 0.0
         rows.append((sym, qv))
@@ -210,24 +230,38 @@ def fetch_kline(symbol: str, interval: str, limit: int = 500) -> pd.DataFrame | 
     with _INVALID_LOCK:
         if symbol in _INVALID_SYMBOLS:
             return None
-    url = f"{BINANCE_FUTURES_API_URL}/klines?symbol={symbol}&interval={interval}&limit={limit}"
-    data = make_api_request(url, use_cache=False)
-    if not data:
+    bybit_interval = BYBIT_INTERVAL_MAP.get(interval)
+    if bybit_interval is None:
+        logging.warning("Unknown interval %s — no Bybit mapping", interval)
         return None
-    df = pd.DataFrame(data, columns=[
-        "open_time", "open", "high", "low", "close", "volume",
-        "close_time", "quote_volume", "num_trades", "taker_buy_base",
-        "taker_buy_quote", "ignore",
-    ])
-    numeric = ["open", "high", "low", "close", "volume", "quote_volume", "taker_buy_base", "taker_buy_quote"]
+    url = (f"{BYBIT_API_URL}/v5/market/kline?category=linear&symbol={symbol}"
+           f"&interval={bybit_interval}&limit={min(limit, 1000)}")
+    data = make_api_request(url, use_cache=False)
+    if not data or data.get("retCode") != 0:
+        with _INVALID_LOCK:
+            _INVALID_SYMBOLS.add(symbol)
+        return None
+    rows = data.get("result", {}).get("list", [])
+    if not rows:
+        return None
+    # Bybit returns candles newest-first: [start, open, high, low, close, volume, turnover]
+    rows = list(reversed(rows))
+    df = pd.DataFrame(rows, columns=["open_time", "open", "high", "low", "close", "volume", "quote_volume"])
+    numeric = ["open", "high", "low", "close", "volume", "quote_volume"]
     for col in numeric:
         df[col] = pd.to_numeric(df[col], errors="coerce")
-    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
-    df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
+    df["open_time"] = pd.to_datetime(pd.to_numeric(df["open_time"]), unit="ms", utc=True)
+    # Bybit doesn't return a close_time in the kline payload — approximate it
+    # as the next candle's open (or now, for the still-forming last candle).
+    df["close_time"] = df["open_time"].shift(-1)
+    df.loc[df.index[-1], "close_time"] = pd.Timestamp.now(tz="UTC")
     now = pd.Timestamp.now(tz="UTC")
-    df = df[df["close_time"] <= now].copy()
+    df = df[df["open_time"] <= now].copy()
     df = df.drop_duplicates(subset=["open_time"]).sort_values("open_time").reset_index(drop=True)
-    df.rename(columns={"open_time": "time", "taker_buy_base": "buy_vol"}, inplace=True)
+    df.rename(columns={"open_time": "time"}, inplace=True)
+    # buy_vol (taker-buy volume) isn't in this endpoint; not used by any
+    # active signal in this script, so fill with a neutral placeholder.
+    df["buy_vol"] = df["volume"] / 2
     return df[["time", "close_time", "open", "high", "low", "close", "volume", "quote_volume", "buy_vol"]]
 
 
