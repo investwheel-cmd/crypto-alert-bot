@@ -11,13 +11,16 @@
 #     same setup every run (designed to be committed back to the
 #     repo by the GitHub Actions workflow)
 #
-# DATA SOURCE: Bybit's public v5 market API (category=linear, i.e.
-# USDT-margined perpetuals), not Binance. Binance's futures API
-# returns HTTP 451 to requests coming from major cloud-provider IP
-# ranges (AWS/GCP/Azure) — which is exactly what GitHub Actions
-# runners use — so it cannot be called reliably from a scheduled
-# GitHub workflow. Bybit's public market-data endpoints do not
-# require an API key and are not on that same blocklist.
+# DATA SOURCE: Kraken's public REST API (spot USDT pairs). Both Binance
+# and Bybit's futures APIs return HTTP 451/403 to requests coming from
+# major cloud-provider IP ranges (AWS/GCP/Azure) — which is exactly what
+# GitHub Actions runners use — so neither can be called reliably from a
+# scheduled GitHub workflow. Kraken is a US-licensed, heavily regulated
+# exchange built to be broadly accessible, including to cloud/CI traffic,
+# and its public market-data endpoints require no API key. Note this uses
+# SPOT prices, not perpetual futures — funding rate / open interest fields
+# from the original design aren't available here, but structure, trend,
+# sweep, OB, and FVG detection all work identically on spot candles.
 #
 # IMPORTANT: This is a research/scanner script. It does not place
 # orders and does not output position sizing. Treat every alert as
@@ -43,16 +46,21 @@ from scipy.signal import find_peaks
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ========================= CONFIG =========================
-BYBIT_API_URL = "https://api.bybit.com"
+KRAKEN_API_URL = "https://api.kraken.com/0/public"
 
-# Bybit's kline endpoint takes interval codes rather than "4h"/"15m" style strings.
-BYBIT_INTERVAL_MAP = {
-    "4h": "240",
-    "15m": "15",
-    "5m": "5",
-    "1d": "D",
-    "1w": "W",
+# Kraken's OHLC endpoint takes interval in minutes.
+KRAKEN_INTERVAL_MAP = {
+    "4h": 240,
+    "15m": 15,
+    "5m": 5,
+    "1d": 1440,
+    "1w": 10080,
 }
+
+# Populated at runtime by get_valid_futures_symbols(): maps our display
+# symbol (e.g. "BTCUSDT") to the pair code Kraken actually expects
+# (e.g. "XBTUSDT", since Kraken uses "XBT" instead of "BTC").
+_KRAKEN_PAIR_MAP: dict[str, str] = {}
 
 DATA_LOOKBACK_4H = 300
 DATA_LOOKBACK_15M = 300
@@ -91,7 +99,7 @@ MSS_LOOKBACK = 8
 ENTRY_DISPLACEMENT_ATR = 0.38
 ENTRY_CLOSE_OUTER_THIRD = 0.66
 
-# Universe: a small static watchlist + top-N by Binance 24h volume
+# Universe: a small static watchlist + top-N by Kraken 24h volume
 ALWAYS_INCLUDE_SYMBOLS = [
     "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
     "DOGEUSDT", "ADAUSDT", "LINKUSDT", "AVAXUSDT", "DOTUSDT",
@@ -186,42 +194,67 @@ def make_api_request(url: str, retries: int = 3, use_cache: bool = True, ttl: in
 
 
 def get_valid_futures_symbols() -> set[str]:
-    """Bybit equivalent of Binance's exchangeInfo: list all tradeable
-    USDT-margined linear perpetuals."""
-    data = make_api_request(f"{BYBIT_API_URL}/v5/market/instruments-info?category=linear", ttl=3600)
-    if not data or data.get("retCode") != 0:
-        logging.warning("Could not fetch Bybit instruments-info — falling back to empty valid set")
+    """Kraken equivalent of Binance's exchangeInfo: list all tradeable
+    USDT-quoted pairs. Builds _KRAKEN_PAIR_MAP as a side effect, since
+    Kraken's own pair codes (e.g. "XBTUSDT" for Bitcoin) don't always
+    match the plain "BTCUSDT"-style symbol we use elsewhere in the script."""
+    global _KRAKEN_PAIR_MAP
+    data = make_api_request(f"{KRAKEN_API_URL}/AssetPairs", ttl=3600)
+    if not data or data.get("error"):
+        logging.warning("Could not fetch Kraken AssetPairs — falling back to empty valid set")
         return set()
+    result = data.get("result", {})
     valid = set()
-    for s in data.get("result", {}).get("list", []):
-        if (s.get("status") == "Trading"
-                and s.get("contractType") == "LinearPerpetual"
-                and s.get("quoteCoin") == "USDT"
-                and str(s.get("symbol", "")).endswith("USDT")):
-            valid.add(s["symbol"])
+    mapping: dict[str, str] = {}
+    for pair_key, info in result.items():
+        quote = info.get("quote", "")
+        if quote != "USDT":
+            continue
+        base = info.get("base", "")
+        display_base = base
+        # Kraken prefixes some legacy assets with "X" (e.g. "XXBT", "XETH")
+        if display_base.startswith("X") and len(display_base) == 4:
+            display_base = display_base[1:]
+        if display_base == "XBT":
+            display_base = "BTC"
+        our_symbol = f"{display_base}USDT"
+        api_pair = info.get("altname", pair_key)
+        valid.add(our_symbol)
+        mapping[our_symbol] = api_pair
+    _KRAKEN_PAIR_MAP = mapping
     return valid
 
 
 def get_top_symbols_by_volume(valid_futures: set[str], top_n: int = TOP_N_BY_VOLUME) -> list[str]:
-    """Replaces the old CoinGecko market-cap ranking: rank Bybit USDT-M
-    perpetuals by 24h turnover (quote volume), using data we already
-    have access to."""
-    data = make_api_request(f"{BYBIT_API_URL}/v5/market/tickers?category=linear", ttl=300, use_cache=True)
-    if not data or data.get("retCode") != 0:
+    """Replaces the old CoinGecko market-cap ranking: rank Kraken USDT
+    pairs by approximate 24h quote volume (base volume x VWAP), using
+    data we already have access to."""
+    if not _KRAKEN_PAIR_MAP:
         return []
+    pairs = [(sym, code) for sym, code in _KRAKEN_PAIR_MAP.items()
+              if sym[:-4] not in STABLE_BLACKLIST]
     rows = []
-    for t in data.get("result", {}).get("list", []):
-        sym = t.get("symbol", "")
-        if sym not in valid_futures:
+    chunk_size = 20
+    for i in range(0, len(pairs), chunk_size):
+        chunk = pairs[i:i + chunk_size]
+        pair_codes = ",".join(code for _, code in chunk)
+        url = f"{KRAKEN_API_URL}/Ticker?pair={pair_codes}"
+        data = make_api_request(url, ttl=300, use_cache=True)
+        if not data or data.get("error"):
             continue
-        base = sym[:-4]  # strip "USDT"
-        if base in STABLE_BLACKLIST:
-            continue
-        try:
-            qv = float(t.get("turnover24h", 0))
-        except (TypeError, ValueError):
-            qv = 0.0
-        rows.append((sym, qv))
+        result = data.get("result", {})
+        reverse_map = {code: sym for sym, code in chunk}
+        for key, info in result.items():
+            sym = reverse_map.get(key)
+            if sym is None:
+                continue
+            try:
+                vol24 = float(info["v"][1])
+                vwap24 = float(info["p"][1])
+                qv = vol24 * vwap24
+            except (KeyError, TypeError, ValueError, IndexError):
+                qv = 0.0
+            rows.append((sym, qv))
     rows.sort(key=lambda x: x[1], reverse=True)
     return [sym for sym, _ in rows[:top_n]]
 
@@ -230,29 +263,37 @@ def fetch_kline(symbol: str, interval: str, limit: int = 500) -> pd.DataFrame | 
     with _INVALID_LOCK:
         if symbol in _INVALID_SYMBOLS:
             return None
-    bybit_interval = BYBIT_INTERVAL_MAP.get(interval)
-    if bybit_interval is None:
-        logging.warning("Unknown interval %s — no Bybit mapping", interval)
+    interval_min = KRAKEN_INTERVAL_MAP.get(interval)
+    if interval_min is None:
+        logging.warning("Unknown interval %s — no Kraken mapping", interval)
         return None
-    url = (f"{BYBIT_API_URL}/v5/market/kline?category=linear&symbol={symbol}"
-           f"&interval={bybit_interval}&limit={min(limit, 1000)}")
+    kraken_pair = _KRAKEN_PAIR_MAP.get(symbol)
+    if not kraken_pair:
+        # Fallback guess if the symbol map hasn't been populated yet
+        base = symbol[:-4]
+        kraken_pair = ("XBTUSDT" if base == "BTC" else f"{base}USDT")
+    url = f"{KRAKEN_API_URL}/OHLC?pair={kraken_pair}&interval={interval_min}"
     data = make_api_request(url, use_cache=False)
-    if not data or data.get("retCode") != 0:
+    if not data or data.get("error"):
         with _INVALID_LOCK:
             _INVALID_SYMBOLS.add(symbol)
         return None
-    rows = data.get("result", {}).get("list", [])
-    if not rows:
+    result = data.get("result", {})
+    series = None
+    for k, v in result.items():
+        if k == "last":
+            continue
+        series = v
+        break
+    if not series:
         return None
-    # Bybit returns candles newest-first: [start, open, high, low, close, volume, turnover]
-    rows = list(reversed(rows))
-    df = pd.DataFrame(rows, columns=["open_time", "open", "high", "low", "close", "volume", "quote_volume"])
-    numeric = ["open", "high", "low", "close", "volume", "quote_volume"]
+    rows = series[-limit:] if limit else series
+    df = pd.DataFrame(rows, columns=["open_time", "open", "high", "low", "close", "vwap", "volume", "count"])
+    numeric = ["open", "high", "low", "close", "vwap", "volume"]
     for col in numeric:
         df[col] = pd.to_numeric(df[col], errors="coerce")
-    df["open_time"] = pd.to_datetime(pd.to_numeric(df["open_time"]), unit="ms", utc=True)
-    # Bybit doesn't return a close_time in the kline payload — approximate it
-    # as the next candle's open (or now, for the still-forming last candle).
+    df["open_time"] = pd.to_datetime(pd.to_numeric(df["open_time"]), unit="s", utc=True).astype("datetime64[ns, UTC]")
+    df["quote_volume"] = df["volume"] * df["close"]  # approx quote volume
     df["close_time"] = df["open_time"].shift(-1)
     df.loc[df.index[-1], "close_time"] = pd.Timestamp.now(tz="UTC")
     now = pd.Timestamp.now(tz="UTC")
@@ -906,7 +947,7 @@ def prune_state(state: dict) -> dict:
 
 # ========================= MAIN =========================
 def run_scan() -> pd.DataFrame:
-    logging.info("Fetching valid Binance Futures symbols...")
+    logging.info("Fetching valid Kraken USDT pairs...")
     valid_futures = get_valid_futures_symbols()
 
     logging.info("Fetching BTC reference data...")
